@@ -95,6 +95,45 @@ func TestToHOrderAndKeys(t *testing.T) {
 	}
 }
 
+func TestToHReturnsIndependentCopy(t *testing.T) {
+	// Ruby's to_h hands back a fresh Hash; mutating it must not disturb the
+	// struct's own ordered table (the copy must not alias the backing array).
+	o := New(Pair{"a", 1}, Pair{"b", 2})
+	h := o.ToH()
+	h[0].Key = Symbol("zzz")
+	h[0].Value = 999
+	h = append(h, Pair{Symbol("c"), 3})
+	if o.Get("a") != 1 {
+		t.Fatalf("mutating ToH result changed struct value: a=%v", o.Get("a"))
+	}
+	again := o.ToH()
+	if again[0].Key != Symbol("a") || again[0].Value != 1 || len(again) != 2 {
+		t.Fatalf("struct order/content corrupted by ToH mutation: %+v", again)
+	}
+}
+
+func TestDeleteFieldReindexesRemaining(t *testing.T) {
+	// Deleting an entry shifts later entries down; their index must stay in sync
+	// so subsequent reads/writes still resolve correctly.
+	o := New(Pair{"a", 1}, Pair{"b", 2}, Pair{"c", 3}, Pair{"d", 4})
+	if _, err := o.DeleteField("b"); err != nil {
+		t.Fatal(err)
+	}
+	// entries after the removed slot are still addressable
+	if o.Get("c") != 3 || o.Get("d") != 4 {
+		t.Fatalf("post-delete reads wrong: c=%v d=%v", o.Get("c"), o.Get("d"))
+	}
+	// overwriting a shifted field lands on the right entry (no phantom append)
+	o.Set("c", 30)
+	if o.Get("c") != 30 || o.Len() != 3 {
+		t.Fatalf("post-delete overwrite wrong: c=%v len=%d", o.Get("c"), o.Len())
+	}
+	m := o.Members()
+	if len(m) != 3 || m[0] != "a" || m[1] != "c" || m[2] != "d" {
+		t.Fatalf("members after delete+overwrite = %v", m)
+	}
+}
+
 func TestEachPair(t *testing.T) {
 	o := New(Pair{"a", 1}, Pair{"b", 2}, Pair{"c", 3})
 	var keys []Symbol
