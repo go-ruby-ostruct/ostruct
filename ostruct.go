@@ -63,10 +63,17 @@ func (e *ArgumentError) Error() string { return e.Message }
 // OpenStruct is the ordered attribute table backing Ruby's OpenStruct. Keys are
 // Symbols; insertion order is preserved across to_h, each_pair, and inspect.
 //
+// The table stores its entries as an insertion-ordered slice of [Pair]s (each
+// Key a Symbol) alongside a Symbol→position index. Keeping the values *in* the
+// ordered slice — rather than in a separate map keyed by the ordered keys — lets
+// [OpenStruct.ToH] serialise with a single slice copy and no per-key hashing,
+// while random access ([OpenStruct.Get]/[OpenStruct.Set]) stays a single map
+// probe.
+//
 // The zero value is not ready for use; construct with [New].
 type OpenStruct struct {
-	keys  []Symbol
-	table map[Symbol]any
+	pairs []Pair         // entries in insertion order; each Key is a Symbol
+	index map[Symbol]int // Symbol → position of its entry in pairs
 }
 
 // New builds an OpenStruct seeded from hash, whose keys are interned to Symbols
@@ -77,7 +84,10 @@ type OpenStruct struct {
 // MRI preserves from the source hash — is deterministic. Pass no pairs for an
 // empty struct.
 func New(hash ...Pair) *OpenStruct {
-	o := &OpenStruct{table: make(map[Symbol]any, len(hash))}
+	o := &OpenStruct{
+		pairs: make([]Pair, 0, len(hash)),
+		index: make(map[Symbol]int, len(hash)),
+	}
 	for _, p := range hash {
 		o.Set(p.Key, p.Value)
 	}
@@ -94,7 +104,10 @@ type Pair struct {
 // Get returns the value of field name (Symbol or string), or nil if the field
 // is not defined — MRI's reader for an undefined attribute returns nil.
 func (o *OpenStruct) Get(name any) any {
-	return o.table[ToSym(name)]
+	if i, ok := o.index[ToSym(name)]; ok {
+		return o.pairs[i].Value
+	}
+	return nil
 }
 
 // Set defines (or overwrites) field name with value, returning value. A new
@@ -102,10 +115,12 @@ func (o *OpenStruct) Get(name any) any {
 // its position. This is MRI's writer (`o.name = value` / `o[name] = value`).
 func (o *OpenStruct) Set(name, value any) any {
 	k := ToSym(name)
-	if _, ok := o.table[k]; !ok {
-		o.keys = append(o.keys, k)
+	if i, ok := o.index[k]; ok {
+		o.pairs[i].Value = value
+		return value
 	}
-	o.table[k] = value
+	o.index[k] = len(o.pairs)
+	o.pairs = append(o.pairs, Pair{Key: k, Value: value})
 	return value
 }
 
@@ -120,28 +135,33 @@ func (o *OpenStruct) SetIndex(name, value any) any { return o.Set(name, value) }
 // respond_to_missing? combines this with its own `name end_with? "="` rule for
 // writers; this core answers only "is this attribute present?".
 func (o *OpenStruct) RespondToField(name any) bool {
-	_, ok := o.table[ToSym(name)]
+	_, ok := o.index[ToSym(name)]
 	return ok
 }
 
 // Len returns the number of defined fields.
-func (o *OpenStruct) Len() int { return len(o.keys) }
+func (o *OpenStruct) Len() int { return len(o.pairs) }
 
 // Members returns the field names (Symbols) in insertion order — MRI's
 // `members`/`to_h.keys`.
 func (o *OpenStruct) Members() []Symbol {
-	out := make([]Symbol, len(o.keys))
-	copy(out, o.keys)
+	out := make([]Symbol, len(o.pairs))
+	for i, p := range o.pairs {
+		out[i] = p.Key.(Symbol)
+	}
 	return out
 }
 
 // ToH returns the table as ordered key/value [Pair]s with Symbol keys in
 // insertion order — MRI's `to_h` (whose Hash preserves that order).
+//
+// Because the entries are already stored in insertion order, this is a single
+// slice copy: no per-key hash probe is needed to rebuild the order. A fresh
+// slice is returned (never the internal backing array), so callers may mutate
+// the result exactly as Ruby's `to_h` hands back an independent Hash.
 func (o *OpenStruct) ToH() []Pair {
-	out := make([]Pair, len(o.keys))
-	for i, k := range o.keys {
-		out[i] = Pair{Key: k, Value: o.table[k]}
-	}
+	out := make([]Pair, len(o.pairs))
+	copy(out, o.pairs)
 	return out
 }
 
@@ -149,8 +169,8 @@ func (o *OpenStruct) ToH() []Pair {
 // returns false. It mirrors MRI's `each_pair` (the host wraps it to yield to a
 // Ruby block or return an Enumerator).
 func (o *OpenStruct) EachPair(fn func(key Symbol, value any) bool) {
-	for _, k := range o.keys {
-		if !fn(k, o.table[k]) {
+	for _, p := range o.pairs {
+		if !fn(p.Key.(Symbol), p.Value) {
 			return
 		}
 	}
@@ -187,16 +207,16 @@ func (o *OpenStruct) Dig(keys ...any) (any, error) {
 // *NameError if the field is not defined — MRI's `delete_field`.
 func (o *OpenStruct) DeleteField(name any) (any, error) {
 	k := ToSym(name)
-	v, ok := o.table[k]
+	i, ok := o.index[k]
 	if !ok {
 		return nil, &NameError{Message: "no field '" + string(k) + "' in " + o.Inspect()}
 	}
-	delete(o.table, k)
-	for i, kk := range o.keys {
-		if kk == k {
-			o.keys = append(o.keys[:i], o.keys[i+1:]...)
-			break
-		}
+	v := o.pairs[i].Value
+	o.pairs = append(o.pairs[:i], o.pairs[i+1:]...)
+	delete(o.index, k)
+	// Entries after the removed slot shifted down one; re-index them.
+	for j := i; j < len(o.pairs); j++ {
+		o.index[o.pairs[j].Key.(Symbol)] = j
 	}
 	return v, nil
 }
@@ -210,12 +230,12 @@ func (o *OpenStruct) Equal(other any) bool {
 	if !ok || ot == nil {
 		return false
 	}
-	if len(o.keys) != len(ot.keys) {
+	if len(o.pairs) != len(ot.pairs) {
 		return false
 	}
-	for k, v := range o.table {
-		ov, present := ot.table[k]
-		if !present || !valueEqual(v, ov) {
+	for _, p := range o.pairs {
+		j, present := ot.index[p.Key.(Symbol)]
+		if !present || !valueEqual(p.Value, ot.pairs[j].Value) {
 			return false
 		}
 	}
@@ -230,18 +250,18 @@ func (o *OpenStruct) Eql(other any) bool { return o.Equal(other) }
 // in insertion order and each value rendered by its [Inspector] (or
 // [InspectValue]); an empty struct renders as `#<OpenStruct>`.
 func (o *OpenStruct) Inspect() string {
-	if len(o.keys) == 0 {
+	if len(o.pairs) == 0 {
 		return "#<OpenStruct>"
 	}
 	var b strings.Builder
 	b.WriteString("#<OpenStruct ")
-	for i, k := range o.keys {
+	for i, p := range o.pairs {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(string(k))
+		b.WriteString(string(p.Key.(Symbol)))
 		b.WriteByte('=')
-		b.WriteString(InspectValue(o.table[k]))
+		b.WriteString(InspectValue(p.Value))
 	}
 	b.WriteByte('>')
 	return b.String()
